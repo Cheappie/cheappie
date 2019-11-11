@@ -108,6 +108,7 @@ public class ConcurrentOutputStreamBuffer implements Closeable {
 
                 for (Buffer buffer : buffersPerPipe) {
                     if (mileage > cpuThrottleFactor) {
+                        mileage = 0;
                         buffer.await();
                     }
 
