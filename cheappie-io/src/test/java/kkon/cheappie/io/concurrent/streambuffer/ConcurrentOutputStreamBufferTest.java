@@ -768,11 +768,11 @@ class ConcurrentOutputStreamBufferTest {
     @Nested
     class StringPipeTest {
         @Test
-        void shouldWriteCommited() throws IOException {
+        void shouldWriteCommited() throws IOException, ExecutionException, InterruptedException {
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
             ConcurrentOutputStreamBuffer buffer = ConcurrentOutputStreamBuffer.builder(outputStream)
                             .withMinElementsWrittenUntilFlush(128).build();
-            buffer.declareExactProducersCount(1);
+            final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = buffer.declareExactProducersCount(1);
 
             int commitedCharsCount = 126;
             int writtenCharsCount = commitedCharsCount;
@@ -790,6 +790,9 @@ class ConcurrentOutputStreamBufferTest {
 
                 assertEquals(writtenCharsCount - commitedCharsCount, pipe.size());
             }
+            notifier.waitUntilDone();
+
+            assertTrue(outputStream.size() >= commitedCharsCount);
         }
 
         private char[] nChars(int len) {
