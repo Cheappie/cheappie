@@ -47,7 +47,7 @@ public final class ConcurrentOutputStreamBuffer {
     private static final int INITIAL_BUFFER_SIZE_MULTIPLIER = 8;
 
     private final OutputStream outputStream;
-    private final int minBytesWrittenUntilFlush;
+    private final int minElementsWrittenUntilFlush;
     private final int memThrottleFactor;
     private final long millisUntilThrottleProducer;
     private final boolean writeEqualChunks;
@@ -65,10 +65,10 @@ public final class ConcurrentOutputStreamBuffer {
     private final AtomicBoolean areProducersAlreadyDeclared;
     private final Phaser awaitProducersWithTimeoutPhaser;
 
-    private ConcurrentOutputStreamBuffer(OutputStream outputStream, int minBytesWrittenUntilFlush,
+    private ConcurrentOutputStreamBuffer(OutputStream outputStream, int minElementsWrittenUntilFlush,
                     int memThrottleFactor, long millisUntilThrottleProducer, boolean writeEqualChunks) {
         this.outputStream = outputStream;
-        this.minBytesWrittenUntilFlush = minBytesWrittenUntilFlush;
+        this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
         this.memThrottleFactor = memThrottleFactor;
         this.millisUntilThrottleProducer = millisUntilThrottleProducer;
         this.writeEqualChunks = writeEqualChunks;
@@ -93,7 +93,7 @@ public final class ConcurrentOutputStreamBuffer {
      * that this constructor will remain the same!
      */
     @VisibleForTesting
-    ConcurrentOutputStreamBuffer(OutputStream outputStream, int minBytesWrittenUntilFlush, int memThrottleFactor,
+    ConcurrentOutputStreamBuffer(OutputStream outputStream, int minElementsWrittenUntilFlush, int memThrottleFactor,
                     long millisUntilThrottleProducer, boolean writeEqualChunks, ScheduledExecutorService executor,
                     ConcurrentHashMap<Integer, List<Buffer>> producerAssociatedBuffers,
                     CopyOnWriteArrayList<Buffer> allProducersBuffers, CopyOnWriteArrayList<Integer> detachedPipes,
@@ -101,7 +101,7 @@ public final class ConcurrentOutputStreamBuffer {
                     AtomicInteger availableSlotsForProducers, AtomicBoolean areProducersAlreadyDeclared,
                     Phaser awaitProducersWithTimeoutPhaser) {
         this.outputStream = outputStream;
-        this.minBytesWrittenUntilFlush = minBytesWrittenUntilFlush;
+        this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
         this.memThrottleFactor = memThrottleFactor;
         this.millisUntilThrottleProducer = millisUntilThrottleProducer;
         this.writeEqualChunks = writeEqualChunks;
@@ -160,7 +160,7 @@ public final class ConcurrentOutputStreamBuffer {
     }
 
     private void initBuffers(Integer producerId) {
-        ArrayList<Buffer> buffers = Stream.generate(() -> new Buffer(minBytesWrittenUntilFlush, memThrottleFactor))
+        ArrayList<Buffer> buffers = Stream.generate(() -> new Buffer(minElementsWrittenUntilFlush, memThrottleFactor))
                         .limit(2).collect(toCollection(ArrayList::new));
 
         producerAssociatedBuffers.put(producerId, buffers);
@@ -186,14 +186,14 @@ public final class ConcurrentOutputStreamBuffer {
 
                 for (Buffer buffer : associatedBuffers) {
                     hasDirtyWrite.set(true);
-                    if (buffer.lock.tryLock()) {
+                    if (buffer.rwTryLock()) {
                         try {
                             WeakFixedByteArray buf = buffer.byteArray;
                             if (buf.write(b, off, len)) {
                                 return;
                             }
                         } finally {
-                            buffer.lock.unlock();
+                            buffer.rwUnlock();
                         }
                     }
 
@@ -210,7 +210,7 @@ public final class ConcurrentOutputStreamBuffer {
     private Future<Void> startTransfer() {
         return executor.submit(() -> {
             try {
-                awaitProducersWithTimeoutPhaser.awaitAdvanceInterruptibly(0, 10, TimeUnit.SECONDS);
+                awaitProducersWithTimeoutPhaser.awaitAdvanceInterruptibly(0, 20, TimeUnit.SECONDS);
 
                 boolean taskRequireContinuation;
                 do {
@@ -232,10 +232,9 @@ public final class ConcurrentOutputStreamBuffer {
                 throw e;
             } finally {
                 isStreamClosed.set(true);
-                outputStream.close();
             }
 
-            executor.shutdown();
+            close();
             return null;
         });
     }
@@ -244,7 +243,7 @@ public final class ConcurrentOutputStreamBuffer {
         int emptyBuffersCount = 0;
 
         for (Buffer buffer : buffers) {
-            if (buffer.lock.tryLock()) {
+            if (buffer.rwTryLock()) {
                 try {
                     WeakFixedByteArray buf = buffer.byteArray;
                     if (buf.size() > 0) {
@@ -254,7 +253,7 @@ public final class ConcurrentOutputStreamBuffer {
                         emptyBuffersCount++;
                     }
                 } finally {
-                    buffer.lock.unlock();
+                    buffer.rwUnlock();
                     buffer.signal();
                 }
             }
@@ -284,25 +283,31 @@ public final class ConcurrentOutputStreamBuffer {
         return activePipesCount.get() > 0;
     }
 
+    private void close() throws IOException {
+        executor.shutdown();
+        outputStream.close();
+    }
+
     public static Builder builder(OutputStream outputStream) {
         return new Builder(outputStream);
     }
 
     public static final class Builder {
         private final OutputStream outputStream;
-        private int minBytesWrittenUntilFlush = 8192;
+        private int minElementsWrittenUntilFlush = 8192;
         private int memThrottleFactor = 64;
         private boolean writeEqualChunks = false;
-        private long millisUntilThrottleProducer = 100;
+        private long millisUntilThrottleProducer = 1000;
 
         private Builder(OutputStream outputStream) {
             Preconditions.checkNotNull(outputStream, "Required: outputStream not null");
             this.outputStream = outputStream;
         }
 
-        public Builder withMinBytesWrittenUntilFlush(int minBytesWrittenUntilFlush) {
-            Preconditions.checkArgument(minBytesWrittenUntilFlush >= 128, "Required: minBytesWrittenUntilFlush >= 128");
-            this.minBytesWrittenUntilFlush = minBytesWrittenUntilFlush;
+        public Builder withMinElementsWrittenUntilFlush(int minElementsWrittenUntilFlush) {
+            Preconditions.checkArgument(minElementsWrittenUntilFlush >= 128,
+                            "Required: minElementsWrittenUntilFlush >= 128");
+            this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
             return this;
         }
 
@@ -324,14 +329,14 @@ public final class ConcurrentOutputStreamBuffer {
         }
 
         public ConcurrentOutputStreamBuffer build() {
-            return new ConcurrentOutputStreamBuffer(outputStream, minBytesWrittenUntilFlush, memThrottleFactor,
+            return new ConcurrentOutputStreamBuffer(outputStream, minElementsWrittenUntilFlush, memThrottleFactor,
                             millisUntilThrottleProducer, writeEqualChunks);
         }
     }
 
     @VisibleForTesting
     static final class Buffer {
-        final ReentrantLock lock;
+        private final ReentrantLock lock;
         final WeakFixedByteArray byteArray;
         final Object condition;
 
@@ -341,6 +346,18 @@ public final class ConcurrentOutputStreamBuffer {
 
             int initialSize = chunkSize * INITIAL_BUFFER_SIZE_MULTIPLIER;
             this.byteArray = new WeakFixedByteArray(chunkSize, initialSize, memThrottleFactor);
+        }
+
+        void rwLock() {
+            this.lock.lock();
+        }
+
+        boolean rwTryLock() {
+            return this.lock.tryLock();
+        }
+
+        void rwUnlock() {
+            this.lock.unlock();
         }
 
         void await() {
@@ -371,8 +388,12 @@ public final class ConcurrentOutputStreamBuffer {
 
         private BytePipe(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId) {
             this.producerId = producerId;
-            this.locBuffer = new ByteArray(concurrentOutputStreamBuffer.minBytesWrittenUntilFlush);
+            this.locBuffer = new ByteArray(concurrentOutputStreamBuffer.minElementsWrittenUntilFlush);
             this.concurrentOutputStreamBuffer = concurrentOutputStreamBuffer;
+        }
+
+        Integer getProducerId() {
+            return producerId;
         }
 
         boolean isPipeClosed() {
@@ -393,7 +414,7 @@ public final class ConcurrentOutputStreamBuffer {
         private void flush(int incomingBytesCount, boolean forceWriteCommited) throws IOException {
             try {
                 if ((forceWriteCommited || locBuffer.size()
-                                + incomingBytesCount >= concurrentOutputStreamBuffer.minBytesWrittenUntilFlush)
+                                + incomingBytesCount >= concurrentOutputStreamBuffer.minElementsWrittenUntilFlush)
                                 && lastCommitIndex > 0) {
                     concurrentOutputStreamBuffer.write(locBuffer.elements(), 0, lastCommitIndex, producerId);
                     locBuffer.softTrim(lastCommitIndex);
@@ -477,7 +498,12 @@ public final class ConcurrentOutputStreamBuffer {
 
             this.bytePipeGateway = new BytePipeToOutputStreamGateway(pipe);
             this.dataOutputStream = new DataOutputStream(bytePipeGateway);
-            this.utf8TemporaryBuffer = new ByteArray(concurrentOutputStreamBuffer.minBytesWrittenUntilFlush);
+            this.utf8TemporaryBuffer = new ByteArray(concurrentOutputStreamBuffer.minElementsWrittenUntilFlush);
+        }
+
+        @VisibleForTesting
+        Integer getProducerId() {
+            return pipe.getProducerId();
         }
 
         public void write(int b) throws IOException {
@@ -594,7 +620,7 @@ public final class ConcurrentOutputStreamBuffer {
 
         private StringPipe(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId,
                         Charset charset) {
-            int size = concurrentOutputStreamBuffer.minBytesWrittenUntilFlush;
+            int size = concurrentOutputStreamBuffer.minElementsWrittenUntilFlush;
 
             this.lineSeparator = System.lineSeparator();
             this.pipe = new BytePipe(concurrentOutputStreamBuffer, producerId);
@@ -604,6 +630,10 @@ public final class ConcurrentOutputStreamBuffer {
             this.transportBuffer = new char[size];
             this.chunkSize = size;
             this.lastCommitIndex = 0;
+        }
+
+        public int size() {
+            return buffer.length();
         }
 
         private void writeTo(OutputStreamWriter outputStreamWriter, int readOffset, int len) throws IOException {
@@ -929,9 +959,12 @@ public final class ConcurrentOutputStreamBuffer {
         public void run() {
             if (LocalDateTime.now().isBefore(deadline) && concurrentOutputStreamBuffer.hasActivePipes()) {
                 concurrentOutputStreamBuffer.allProducersBuffers.forEach(Buffer::signal);
-                concurrentOutputStreamBuffer.executor.schedule(this, 1, TimeUnit.SECONDS);
+                concurrentOutputStreamBuffer.executor.schedule(this, 100, TimeUnit.MILLISECONDS);
             } else {
-                concurrentOutputStreamBuffer.executor.shutdown();
+                try {
+                    concurrentOutputStreamBuffer.close();
+                } catch (Exception ignored) {
+                }
             }
         }
     }

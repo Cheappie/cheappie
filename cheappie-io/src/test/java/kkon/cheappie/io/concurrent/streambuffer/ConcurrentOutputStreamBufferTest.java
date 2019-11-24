@@ -16,7 +16,6 @@ package kkon.cheappie.io.concurrent.streambuffer;
 import com.google.common.primitives.Bytes;
 import com.google.common.primitives.Chars;
 import org.apache.commons.lang3.ArrayUtils;
-import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -33,7 +32,9 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -49,8 +50,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
+import static org.apache.commons.lang3.exception.ExceptionUtils.rethrow;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -62,6 +65,127 @@ import static org.mockito.Mockito.spy;
 
 class ConcurrentOutputStreamBufferTest {
     private final Random random = new Random();
+
+    @Test
+    void shouldCloseResourcesEvenWhenOutputStreamWouldCauseFailure() {
+        Mock mockBuilder = Mock.builder();
+        mockBuilder.outputStream = new OutputStream() {
+            @Override
+            public void write(int b) {}
+
+            @Override
+            public void close() throws IOException {
+                throw new IOException("any kind of failure");
+            }
+        };
+
+        ConcurrentOutputStreamBuffer buffer = mockBuilder.build();
+        ConcurrentOutputStreamBuffer.CompletionNotifier notifier = buffer.declareExactProducersCount(1);
+
+        submitTaskToSeparateThread(() -> {
+            try (ConcurrentOutputStreamBuffer.GenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+                pipe.write(1);
+            }
+        });
+
+        try {
+            notifier.waitUntilDone();
+        } catch (Exception ignored) {
+        }
+
+        assertTrue(mockBuilder.executor.isShutdown());
+    }
+
+    @Test
+    void producerShouldFillOnlyAssociatedBuffers() throws InterruptedException, ExecutionException, TimeoutException {
+        Mock mockBuilder = Mock.builder();
+
+        // setup small buffers to quickly fill them up
+        mockBuilder.allProducersBuffers = spy(new CopyOnWriteArrayList<>());
+        mockBuilder.memThrottleFactor = 8;
+        mockBuilder.minBytesWrittenUntilFlush = 128;
+
+        // phaser with 1 party will make broker thread await n + 1 producers to prevent any action from broker
+        Phaser phaser = new Phaser(1);
+        mockBuilder.awaitProducersWithTimeoutPhaser = phaser;
+
+        ConcurrentOutputStreamBuffer buffer = mockBuilder.build();
+        buffer.declareExactProducersCount(2);
+
+        AtomicInteger activeProducerId = new AtomicInteger();
+        CountDownLatch producerIdLatch = new CountDownLatch(1);
+
+        Future<?> activelyWritingProducer = submitTaskToSeparateThread(() -> {
+            try (ConcurrentOutputStreamBuffer.GenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+                activeProducerId.set(pipe.getProducerId());
+                producerIdLatch.countDown();
+
+                while (!Thread.currentThread().isInterrupted()) {
+                    pipe.write(1);
+                    pipe.commit();
+                }
+            }
+        });
+
+        Future<?> lazyProducer = submitTaskToSeparateThread(() -> {
+            try (ConcurrentOutputStreamBuffer.GenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+                while (!Thread.currentThread().isInterrupted()) {
+                }
+            }
+        });
+
+        awaitWithTimeout(producerIdLatch::await, 5);
+
+        try {
+            assertEachProducerWriteOnlyToAssociatedBuffer(mockBuilder, activeProducerId.get());
+        } finally {
+            activelyWritingProducer.cancel(true);
+            lazyProducer.cancel(true);
+            phaser.arriveAndDeregister();
+        }
+    }
+
+    private void assertEachProducerWriteOnlyToAssociatedBuffer(Mock mockBuilder, int activeProducerId)
+                    throws InterruptedException, ExecutionException, TimeoutException {
+
+        List<ConcurrentOutputStreamBuffer.Buffer> activelyWrittenBuffers =
+                        mockBuilder.producerAssociatedBuffers.get(activeProducerId);
+
+        List<ConcurrentOutputStreamBuffer.Buffer> lazyBuffers = mockBuilder.producerAssociatedBuffers.entrySet()
+                        .stream().filter(p -> p.getKey() != activeProducerId).map(Map.Entry::getValue)
+                        .flatMap(List::stream).collect(Collectors.toList());
+
+        awaitWithTimeout(() -> {
+            boolean isDataCorrectlyDistributed;
+
+            do {
+                isDataCorrectlyDistributed = true;
+
+                for (ConcurrentOutputStreamBuffer.Buffer buffer : activelyWrittenBuffers) {
+                    buffer.rwLock();
+                    try {
+                        if (buffer.byteArray.size() == 0) {
+                            isDataCorrectlyDistributed = false;
+                        }
+                    } finally {
+                        buffer.rwUnlock();
+                    }
+                }
+
+                for (ConcurrentOutputStreamBuffer.Buffer buffer : lazyBuffers) {
+                    buffer.rwLock();
+                    try {
+                        if (buffer.byteArray.size() != 0) {
+                            isDataCorrectlyDistributed = false;
+                        }
+                    } finally {
+                        buffer.rwUnlock();
+                    }
+                }
+
+            } while (!isDataCorrectlyDistributed);
+        }, 5);
+    }
 
     @Test
     void shouldDetachClosedPipes() throws InterruptedException, ExecutionException, TimeoutException {
@@ -115,8 +239,8 @@ class ConcurrentOutputStreamBufferTest {
     @Test
     void shouldForwardCommitedBytes() throws ExecutionException, InterruptedException, TimeoutException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        ConcurrentOutputStreamBuffer streamBuffer =
-                        ConcurrentOutputStreamBuffer.builder(outputStream).withMinBytesWrittenUntilFlush(128).build();
+        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
+                        .withMinElementsWrittenUntilFlush(128).build();
 
         byte[] byteArrayWhichExceedPipeBuffer = nBytes(256);
         final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
@@ -175,8 +299,8 @@ class ConcurrentOutputStreamBufferTest {
     @Test
     void shouldNotForwardNotCommitedBytes() throws InterruptedException, ExecutionException, TimeoutException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        ConcurrentOutputStreamBuffer streamBuffer =
-                        ConcurrentOutputStreamBuffer.builder(outputStream).withMinBytesWrittenUntilFlush(128).build();
+        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
+                        .withMinElementsWrittenUntilFlush(128).build();
 
         byte[] bytesWhichExceedPipeBuffer = nBytes(256);
         final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
@@ -219,7 +343,7 @@ class ConcurrentOutputStreamBufferTest {
                     hangBrokerThread.await();
                     throw new RuntimeException("Any kind of failure");
                 } catch (InterruptedException ex) {
-                    ExceptionUtils.rethrow(ex);
+                    rethrow(ex);
                 }
             }
 
@@ -229,8 +353,8 @@ class ConcurrentOutputStreamBufferTest {
             }
         };
 
-        ConcurrentOutputStreamBuffer streamBuffer =
-                        ConcurrentOutputStreamBuffer.builder(outputStream).withMinBytesWrittenUntilFlush(128).build();
+        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
+                        .withMinElementsWrittenUntilFlush(128).withMillisUntilThrottleProducer(100).build();
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(concurrency);
         List<Thread> producers = new ArrayList<>();
 
@@ -264,7 +388,7 @@ class ConcurrentOutputStreamBufferTest {
         awaitWithTimeout(confirmCloseMethodInvocation::await, 10);
     }
 
-    private void awaitProducers(List<Thread> producers, Thread.State state)
+    private static void awaitProducers(List<Thread> producers, Thread.State state)
                     throws InterruptedException, ExecutionException, TimeoutException {
         awaitWithTimeout(() -> {
             boolean areAllThreadsWaiting;
@@ -305,6 +429,70 @@ class ConcurrentOutputStreamBufferTest {
 
     private interface RethrowableFunction<T, R> {
         R apply(T val) throws Exception;
+    }
+
+    @Nested
+    class BufferTest {
+
+        @Test
+        void tryLockShouldGetRejectedWhenLockIsAlreadyTaken()
+                        throws InterruptedException, TimeoutException, ExecutionException {
+            ConcurrentOutputStreamBuffer.Buffer buffer = new ConcurrentOutputStreamBuffer.Buffer(1, 8);
+            CountDownLatch separateThreadHasTakenLockLatch = new CountDownLatch(1);
+            CountDownLatch awaitAssertionsLatch = new CountDownLatch(1);
+            CountDownLatch releaseLockLatch = new CountDownLatch(1);
+
+            submitTaskToSeparateThread(() -> {
+                buffer.rwLock();
+
+                separateThreadHasTakenLockLatch.countDown();
+                awaitAssertionsLatch.await();
+
+                releaseLockLatch.countDown();
+                buffer.rwUnlock();
+            });
+
+            awaitWithTimeout(separateThreadHasTakenLockLatch::await, 5);
+            assertFalse(buffer.rwTryLock());
+
+            awaitAssertionsLatch.countDown();
+
+            awaitWithTimeout(releaseLockLatch::await, 5);
+            assertTrue(buffer.rwTryLock());
+            buffer.rwUnlock();
+        }
+
+        @Test
+        void shouldPutThreadIntoWaitingState() throws InterruptedException, ExecutionException, TimeoutException {
+            ConcurrentOutputStreamBuffer.Buffer buffer = new ConcurrentOutputStreamBuffer.Buffer(1, 8);
+
+            Thread th = new Thread(buffer::await);
+            th.start();
+
+            awaitProducers(Collections.singletonList(th), Thread.State.WAITING);
+        }
+
+        @Test
+        void shouldReleaseThreadFromWaitingState() throws InterruptedException, ExecutionException, TimeoutException {
+            ConcurrentOutputStreamBuffer.Buffer buffer = new ConcurrentOutputStreamBuffer.Buffer(1, 8);
+
+            Thread th = new Thread(() -> {
+                buffer.await();
+                while (!Thread.currentThread().isInterrupted()) {
+                }
+            });
+            th.start();
+
+            List<Thread> producers = Collections.singletonList(th);
+            awaitProducers(producers, Thread.State.WAITING);
+
+            // release from waiting state
+            buffer.signal();
+
+            awaitProducers(producers, Thread.State.RUNNABLE);
+            th.interrupt();
+        }
+
     }
 
     @Nested
@@ -350,7 +538,7 @@ class ConcurrentOutputStreamBufferTest {
                         RethrowableConsumer<ConcurrentOutputStreamBuffer.GenericPipe> contentProvider)
                         throws Exception {
             ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                            .withMinBytesWrittenUntilFlush(1024).build();
+                            .withMinElementsWrittenUntilFlush(1024).build();
 
             ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
             try (ConcurrentOutputStreamBuffer.GenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
@@ -578,7 +766,42 @@ class ConcurrentOutputStreamBufferTest {
     }
 
     @Nested
-    public class StringPipeTest {
+    class StringPipeTest {
+        @Test
+        void shouldWriteCommited() throws IOException {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            ConcurrentOutputStreamBuffer buffer = ConcurrentOutputStreamBuffer.builder(outputStream)
+                            .withMinElementsWrittenUntilFlush(128).build();
+            buffer.declareExactProducersCount(1);
+
+            int commitedCharsCount = 126;
+            int writtenCharsCount = commitedCharsCount;
+            try (ConcurrentOutputStreamBuffer.StringPipe pipe = buffer.acquireWritableStringPipe()) {
+                pipe.write(nChars(commitedCharsCount));
+                pipe.commit();
+
+                pipe.write("1");
+                writtenCharsCount += 1;
+
+                assertEquals(commitedCharsCount + 1, pipe.size());
+
+                pipe.write("1");
+                writtenCharsCount += 1;
+
+                assertEquals(writtenCharsCount - commitedCharsCount, pipe.size());
+            }
+        }
+
+        private char[] nChars(int len) {
+            char[] chars = new char[len];
+
+            for (int i = 0; i < chars.length; i++) {
+                chars[i] = (char) (i & 0x7F);
+            }
+
+            return chars;
+        }
+
         @ParameterizedTest
         @ArgumentsSource(DefaultConcurrency.class)
         void shouldPreserveCommitedWriteConsistency(int concurrency)
