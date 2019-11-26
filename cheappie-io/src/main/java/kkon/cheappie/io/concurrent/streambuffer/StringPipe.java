@@ -18,6 +18,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
+import java.util.Optional;
 
 class StringPipe implements Closeable {
     private final OutputStreamWriter stringPipeOutputStream;
@@ -26,16 +27,16 @@ class StringPipe implements Closeable {
     private final String lineSeparator;
 
     private final char[] transportBuffer;
-    private final int chunkSize;
+    private final int minPipeTXSize;
 
-    StringPipe(BytePipe pipe, int chunkSize, Charset charset) {
+    StringPipe(BytePipe pipe, int minPipeTXSize, Charset charset) {
         this.pipe = pipe;
         this.lineSeparator = System.lineSeparator();
-        this.stringPipeOutputStream = new OutputStreamWriter(new BytePipeToOutputStreamGateway(pipe), charset);
+        this.stringPipeOutputStream = new OutputStreamWriter(pipe, charset);
 
-        this.buffer = new StringBuilder(chunkSize);
-        this.transportBuffer = new char[chunkSize];
-        this.chunkSize = chunkSize;
+        this.buffer = new StringBuilder(minPipeTXSize);
+        this.transportBuffer = new char[minPipeTXSize];
+        this.minPipeTXSize = minPipeTXSize;
     }
 
     @VisibleForTesting
@@ -44,15 +45,15 @@ class StringPipe implements Closeable {
     }
 
     private void writeTo(OutputStreamWriter outputStreamWriter, int readOffset, int len) throws IOException {
-        int skipLastChunkDuringIteration = len - chunkSize;
+        int skipLastChunkDuringIteration = len - minPipeTXSize;
 
         while (readOffset < skipLastChunkDuringIteration) {
-            int nextEndIndex = readOffset + chunkSize;
+            int nextEndIndex = readOffset + minPipeTXSize;
 
             buffer.getChars(readOffset, nextEndIndex, transportBuffer, 0);
             outputStreamWriter.write(transportBuffer);
 
-            readOffset += chunkSize;
+            readOffset += minPipeTXSize;
         }
 
         int leftOvers = len - readOffset;
@@ -65,7 +66,7 @@ class StringPipe implements Closeable {
     protected void flush(int incomingCharsCount, boolean forceWrite) throws IOException {
         final int len = buffer.length();
 
-        if (forceWrite || len >= chunkSize) {
+        if (forceWrite || len >= minPipeTXSize) {
             unconditionalFlush(len);
             softTrim(len);
         }
@@ -151,8 +152,10 @@ class StringPipe implements Closeable {
             return;
         }
 
-        flush(0, true);
-        pipe.close();
-        stringPipeOutputStream.close();
+        Optional<Exception> exception = ExceptionUtil.invokeUnconditionally(() -> flush(0, true),
+                        stringPipeOutputStream::close, pipe::close);
+        if (exception.isPresent()) {
+            throw new IOException(exception.get());
+        }
     }
 }

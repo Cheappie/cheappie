@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
 
-class CommittedGenericPipeTest {
+class TXGenericPipeTest {
     private Random random = new Random();
 
     @Test
@@ -48,10 +48,10 @@ class CommittedGenericPipeTest {
     private void write(ByteArrayOutputStream outputStream, RethrowableConsumer<GenericPipe> contentProvider)
                     throws Exception {
         ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                        .withMinElementsWrittenUntilFlush(1024).build();
+                        .inWrite(1024).build();
 
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
-        try (CommittedGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
+        try (TXGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
             contentProvider.accept(pipe);
             pipe.commit();
         }
@@ -181,7 +181,7 @@ class CommittedGenericPipeTest {
         final ConcurrentOutputStreamBuffer buffer = ConcurrentOutputStreamBuffer.builder(os).build();
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = buffer.declareExactProducersCount(1);
 
-        final CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe();
+        final TXGenericPipe pipe = buffer.acquireWritableGenericPipe();
 
         contentProvider.accept(pipe);
         pipe.commit();

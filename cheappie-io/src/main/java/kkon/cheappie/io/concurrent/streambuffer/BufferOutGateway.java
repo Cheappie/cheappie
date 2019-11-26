@@ -13,19 +13,21 @@
 
 package kkon.cheappie.io.concurrent.streambuffer;
 
-public final class CommittedGenericPipe extends GenericPipe {
-    private final CommittedBytePipe pipe;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.OutputStream;
 
-    CommittedGenericPipe(CommittedBytePipe pipe) {
-        super(pipe, pipe.minElementsWrittenUntilFlush);
-        this.pipe = pipe;
+abstract class BufferOutGateway implements Closeable {
+    protected final OutputStream outputStream;
+
+    BufferOutGateway(OutputStream outputStream) {
+        this.outputStream = outputStream;
     }
 
-    Integer getProducerId() {
-        return pipe.getProducerId();
-    }
+    public abstract void eatBytes(ConcurrentOutputStreamBuffer.Buffer buffer) throws IOException;
 
-    public void commit() {
-        pipe.commit();
+    @Override
+    public void close() throws IOException {
+        outputStream.close();
     }
 }

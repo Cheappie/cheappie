@@ -15,12 +15,12 @@ package kkon.cheappie.io.concurrent.streambuffer;
 
 import java.io.IOException;
 
-final class CommittedBytePipe extends BytePipe {
+final class TXBytePipe extends BytePipe {
     private int lastCommitIndex = 0;
     private final Integer producerId;
 
-    CommittedBytePipe(ConcurrentOutputStreamGateway outputStreamGateway, int minElementsWrittenUntilFlush) {
-        super(outputStreamGateway, minElementsWrittenUntilFlush);
+    TXBytePipe(BufferInGateway outputStreamGateway, int minPipeTXSize) {
+        super(outputStreamGateway, minPipeTXSize);
         this.producerId = outputStreamGateway.getProducerId();
     }
 
@@ -31,7 +31,7 @@ final class CommittedBytePipe extends BytePipe {
     @Override
     protected void flush(int incomingBytesCount, boolean forceWrite) throws IOException {
         int actuallyWrittenSize = locBuffer.size();
-        if ((forceWrite || actuallyWrittenSize + incomingBytesCount >= minElementsWrittenUntilFlush)
+        if ((forceWrite || actuallyWrittenSize + incomingBytesCount >= minPipeTXSize)
                         && lastCommitIndex > 0) {
             unconditionalFlush(lastCommitIndex);
             locBuffer.softTrim(lastCommitIndex);

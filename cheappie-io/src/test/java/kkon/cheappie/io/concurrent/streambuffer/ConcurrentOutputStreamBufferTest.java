@@ -52,6 +52,11 @@ import static org.mockito.Mockito.spy;
 class ConcurrentOutputStreamBufferTest {
 
     @Test
+    void check() {
+        // todo
+    }
+
+    @Test
     void shouldCloseResourcesEvenWhenOutputStreamWouldCauseFailure() {
         Mock mockBuilder = Mock.builder();
         mockBuilder.outputStream = new OutputStream() {
@@ -68,7 +73,7 @@ class ConcurrentOutputStreamBufferTest {
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = buffer.declareExactProducersCount(1);
 
         submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
                 pipe.write(1);
             }
         });
@@ -101,7 +106,7 @@ class ConcurrentOutputStreamBufferTest {
         CountDownLatch producerIdLatch = new CountDownLatch(1);
 
         Future<?> activelyWritingProducer = submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
                 activeProducerId.set(pipe.getProducerId());
                 producerIdLatch.countDown();
 
@@ -113,7 +118,7 @@ class ConcurrentOutputStreamBufferTest {
         });
 
         Future<?> lazyProducer = submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
                 while (!Thread.currentThread().isInterrupted()) {
                 }
             }
@@ -149,7 +154,7 @@ class ConcurrentOutputStreamBufferTest {
                 for (ConcurrentOutputStreamBuffer.Buffer buffer : activelyWrittenBuffers) {
                     buffer.rwLock();
                     try {
-                        if (buffer.byteArray.size() == 0) {
+                        if (buffer.size() == 0) {
                             isDataCorrectlyDistributed = false;
                         }
                     } finally {
@@ -160,7 +165,7 @@ class ConcurrentOutputStreamBufferTest {
                 for (ConcurrentOutputStreamBuffer.Buffer buffer : lazyBuffers) {
                     buffer.rwLock();
                     try {
-                        if (buffer.byteArray.size() != 0) {
+                        if (buffer.size() != 0) {
                             isDataCorrectlyDistributed = false;
                         }
                     } finally {
@@ -186,14 +191,14 @@ class ConcurrentOutputStreamBufferTest {
         CountDownLatch awaitProducersRegistered = new CountDownLatch(2);
 
         submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
                 awaitProducersRegistered.countDown();
                 firstThreadLatch.await();
             }
         });
 
         submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = buffer.acquireWritableGenericPipe()) {
                 awaitProducersRegistered.countDown();
                 secondThreadLatch.await();
             }
@@ -224,14 +229,14 @@ class ConcurrentOutputStreamBufferTest {
     @Test
     void shouldForwardCommitedBytes() throws ExecutionException, InterruptedException, TimeoutException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                        .withMinElementsWrittenUntilFlush(128).build();
+        ConcurrentOutputStreamBuffer streamBuffer =
+                        ConcurrentOutputStreamBuffer.builder(outputStream).inWrite(128).build();
 
         byte[] byteArrayWhichExceedPipeBuffer = nBytes(256);
         final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
 
         Future<?> future = submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
                 pipe.write(byteArrayWhichExceedPipeBuffer);
                 pipe.commit();
             }
@@ -248,13 +253,13 @@ class ConcurrentOutputStreamBufferTest {
     @Test
     void shouldNotForwardNotCommitedBytes() throws InterruptedException, ExecutionException, TimeoutException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                        .withMinElementsWrittenUntilFlush(128).build();
+        ConcurrentOutputStreamBuffer streamBuffer =
+                        ConcurrentOutputStreamBuffer.builder(outputStream).inWrite(128).build();
 
         byte[] bytesWhichExceedPipeBuffer = nBytes(256);
         final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
         Future<?> future = submitTaskToSeparateThread(() -> {
-            try (CommittedGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
                 pipe.write(bytesWhichExceedPipeBuffer);
             }
         });
@@ -302,8 +307,8 @@ class ConcurrentOutputStreamBufferTest {
             }
         };
 
-        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                        .withMinElementsWrittenUntilFlush(128).withMillisUntilThrottleProducer(100).build();
+        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream).inWrite(128)
+                        .withMillisUntilThrottleProducer(100).build();
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(concurrency);
         List<Thread> producers = new ArrayList<>();
 
@@ -311,7 +316,7 @@ class ConcurrentOutputStreamBufferTest {
         AtomicInteger releasedProducersCounter = new AtomicInteger();
         for (int k = 0; k < concurrency; k++) {
             Thread thread = new Thread(() -> {
-                try (CommittedGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
+                try (TXGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
                     while (true) {
                         pipe.write(1);
                         pipe.commit();
@@ -374,7 +379,7 @@ class ConcurrentOutputStreamBufferTest {
         int repetitions = 1_000_00;
 
         assertWriteConsistency(concurrency, repetitions, streamBuffer -> {
-            try (CommittedGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
+            try (TXGenericPipe pipe = streamBuffer.acquireWritableGenericPipe()) {
                 for (int i = 0; i < repetitions; i++) {
                     for (byte[] bytes : simplePhrase) {
                         pipe.write(bytes);
@@ -394,7 +399,7 @@ class ConcurrentOutputStreamBufferTest {
         int repetitions = 1_000_00;
 
         assertWriteConsistency(concurrency, repetitions, streamBuffer -> {
-            try (CommittedStringPipe pipe = streamBuffer.acquireWritableStringPipe()) {
+            try (TXStringPipe pipe = streamBuffer.acquireWritableStringPipe()) {
                 for (int i = 0; i < repetitions; i++) {
                     for (String singleLetter : simplePhrase) {
                         pipe.write(singleLetter);
@@ -406,18 +411,14 @@ class ConcurrentOutputStreamBufferTest {
         });
     }
 
+
     static void assertWriteConsistency(int concurrency, int repetitions,
                     TestUtils.RethrowableConsumer<ConcurrentOutputStreamBuffer> contentProvider)
                     throws InterruptedException, ExecutionException, TimeoutException {
 
-        CountDownLatch confirmCloseMethodInvocation = new CountDownLatch(1);
-        ByteArrayOutputStream outputStream = spy(new ByteArrayOutputStream() {
-            @Override
-            public void close() {
-                confirmCloseMethodInvocation.countDown();
-            }
-        });
-        ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream).build();
+        final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        ConcurrentOutputStreamBuffer streamBuffer =
+                        ConcurrentOutputStreamBuffer.builder(outputStream).inWrite(512).outWrite(512).build();
 
         // simulate equal chances for producers
         CountDownLatch awaitProducersLatch = new CountDownLatch(concurrency);
@@ -445,7 +446,6 @@ class ConcurrentOutputStreamBufferTest {
         assertEquals(0, result.replace(originalPhrase, "").length());
 
         assertTrue(notifier.isTransferDone());
-        awaitWithTimeout(confirmCloseMethodInvocation::await, 10);
     }
 
     static String originalPhrase() {
@@ -633,44 +633,24 @@ class ConcurrentOutputStreamBufferTest {
             byteArray.write(new byte[] {1}, 0, 1);
             assertEquals(1, byteArray.size());
 
-            byteArray.reset();
+            byteArray.clear();
             assertEquals(0, byteArray.size());
         }
 
-        @Test
-        void shouldTransferBytes() throws IOException {
-            ConcurrentOutputStreamBuffer.WeakFixedByteArray byteArray =
-                            new ConcurrentOutputStreamBuffer.WeakFixedByteArray(CHUNK_SIZE, INITIAL_SIZE,
-                                            DEFAULT_THROTTLE_FACTOR);
-
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            byte[] bytes = new byte[] {1, 2, 3};
-            byteArray.write(bytes, 0, bytes.length);
-            byteArray.writeTo(outputStream, false);
-
-            assertEquals(bytes.length, byteArray.size());
-            assertArrayEquals(bytes, outputStream.toByteArray());
-        }
-
-        @Test
-        void shouldWriteEqualChunks() throws IOException {
-            int chunkSize = 2;
-            ConcurrentOutputStreamBuffer.WeakFixedByteArray byteArray =
-                            new ConcurrentOutputStreamBuffer.WeakFixedByteArray(chunkSize, 3, 5);
-
-            byte[][] writtenChunks = new byte[][] {new byte[] {1, 2}, new byte[] {3, 4}, new byte[] {5}};
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream() {
-                int index = 0;
-
-                @Override
-                public synchronized void write(byte[] b, int off, int len) {
-                    assertArrayEquals(writtenChunks[index++], Arrays.copyOfRange(b, off, off + len));
-                }
-            };
-
-            byteArray.write(new byte[] {1, 2, 3, 4, 5}, 0, 5);
-            byteArray.writeTo(outputStream, true);
-        }
+        // @Test
+        // void shouldTransferBytes() throws IOException {
+        // ConcurrentOutputStreamBuffer.WeakFixedByteArray byteArray =
+        // new ConcurrentOutputStreamBuffer.WeakFixedByteArray(CHUNK_SIZE, INITIAL_SIZE,
+        // DEFAULT_THROTTLE_FACTOR);
+        //
+        // ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        // byte[] bytes = new byte[] {1, 2, 3};
+        // byteArray.write(bytes, 0, bytes.length);
+        // byteArray.writeTo(outputStream, false);
+        //
+        // assertEquals(bytes.length, byteArray.size());
+        // assertArrayEquals(bytes, outputStream.toByteArray());
+        // }
     }
 
     @Nested
@@ -724,7 +704,6 @@ class ConcurrentOutputStreamBufferTest {
         int minBytesWrittenUntilFlush = 128;
         int memThrottleFactor = 8;
         long millisUntilThrottleProducer = 100;
-        boolean writeEqualChunks = false;
 
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
         ConcurrentHashMap<Integer, List<ConcurrentOutputStreamBuffer.Buffer>> producerAssociatedBuffers =
@@ -745,10 +724,11 @@ class ConcurrentOutputStreamBufferTest {
         }
 
         ConcurrentOutputStreamBuffer build() {
-            return new ConcurrentOutputStreamBuffer(outputStream, minBytesWrittenUntilFlush, memThrottleFactor,
-                            millisUntilThrottleProducer, writeEqualChunks, executor, producerAssociatedBuffers,
-                            allProducersBuffers, detachedPipes, isStreamClosed, activePipesCount, hasDirtyWrite,
-                            availableSlotsForProducers, areProducersAlreadyDeclared, awaitProducersWithTimeoutPhaser);
+            return new ConcurrentOutputStreamBuffer(new SimplePassThroughGateway(outputStream),
+                            minBytesWrittenUntilFlush, memThrottleFactor, millisUntilThrottleProducer, executor,
+                            producerAssociatedBuffers, allProducersBuffers, detachedPipes, isStreamClosed,
+                            activePipesCount, hasDirtyWrite, availableSlotsForProducers, areProducersAlreadyDeclared,
+                            awaitProducersWithTimeoutPhaser);
         }
     }
 }

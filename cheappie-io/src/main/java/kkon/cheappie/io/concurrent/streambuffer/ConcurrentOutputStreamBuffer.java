@@ -15,6 +15,7 @@ package kkon.cheappie.io.concurrent.streambuffer;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
@@ -42,11 +43,10 @@ import static org.apache.commons.lang3.exception.ExceptionUtils.rethrow;
 public final class ConcurrentOutputStreamBuffer {
     private static final int INITIAL_BUFFER_SIZE_MULTIPLIER = 8;
 
-    private final OutputStream outputStream;
+    private final BufferOutGateway bufferOutGateway;
     private final int memThrottleFactor;
     private final long millisUntilThrottleProducer;
-    private final boolean writeEqualChunks;
-    private final int minElementsWrittenUntilFlush;
+    private final int minPipeTXSize;
 
     private final ScheduledExecutorService executor;
     private final ConcurrentHashMap<Integer, List<Buffer>> producerAssociatedBuffers;
@@ -61,13 +61,12 @@ public final class ConcurrentOutputStreamBuffer {
     private final AtomicBoolean areProducersAlreadyDeclared;
     private final Phaser awaitProducersWithTimeoutPhaser;
 
-    private ConcurrentOutputStreamBuffer(OutputStream outputStream, int minElementsWrittenUntilFlush,
-                    int memThrottleFactor, long millisUntilThrottleProducer, boolean writeEqualChunks) {
-        this.outputStream = outputStream;
-        this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
+    private ConcurrentOutputStreamBuffer(BufferOutGateway bufferOutGateway, int minPipeTXSize, int memThrottleFactor,
+                    long millisUntilThrottleProducer) {
+        this.bufferOutGateway = bufferOutGateway;
+        this.minPipeTXSize = minPipeTXSize;
         this.memThrottleFactor = memThrottleFactor;
         this.millisUntilThrottleProducer = millisUntilThrottleProducer;
-        this.writeEqualChunks = writeEqualChunks;
 
         this.executor = Executors.newSingleThreadScheduledExecutor();
         this.producerAssociatedBuffers = new ConcurrentHashMap<>();
@@ -89,18 +88,17 @@ public final class ConcurrentOutputStreamBuffer {
      * that this constructor will remain the same!
      */
     @VisibleForTesting
-    ConcurrentOutputStreamBuffer(OutputStream outputStream, int minElementsWrittenUntilFlush, int memThrottleFactor,
-                    long millisUntilThrottleProducer, boolean writeEqualChunks, ScheduledExecutorService executor,
+    ConcurrentOutputStreamBuffer(BufferOutGateway bufferOutGateway, int minPipeTXSize, int memThrottleFactor,
+                    long millisUntilThrottleProducer, ScheduledExecutorService executor,
                     ConcurrentHashMap<Integer, List<Buffer>> producerAssociatedBuffers,
                     CopyOnWriteArrayList<Buffer> allProducersBuffers, CopyOnWriteArrayList<Integer> detachedPipes,
                     AtomicBoolean isStreamClosed, AtomicInteger activePipesCount, AtomicBoolean hasDirtyWrite,
                     AtomicInteger availableSlotsForProducers, AtomicBoolean areProducersAlreadyDeclared,
                     Phaser awaitProducersWithTimeoutPhaser) {
-        this.outputStream = outputStream;
-        this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
+        this.bufferOutGateway = bufferOutGateway;
+        this.minPipeTXSize = minPipeTXSize;
         this.memThrottleFactor = memThrottleFactor;
         this.millisUntilThrottleProducer = millisUntilThrottleProducer;
-        this.writeEqualChunks = writeEqualChunks;
         this.executor = executor;
         this.producerAssociatedBuffers = producerAssociatedBuffers;
         this.allProducersBuffers = allProducersBuffers;
@@ -127,17 +125,16 @@ public final class ConcurrentOutputStreamBuffer {
         return new CompletionNotifier(future);
     }
 
-    public CommittedStringPipe acquireWritableStringPipe() {
+    public TXStringPipe acquireWritableStringPipe() {
         return acquireWritableStringPipe(Charset.defaultCharset());
     }
 
-    public CommittedStringPipe acquireWritableStringPipe(Charset charset) {
+    public TXStringPipe acquireWritableStringPipe(Charset charset) {
         int producerId = registerPipe();
         initBuffers(producerId);
 
-        ConcurrentOutputStreamGateway OutputStreamGateway = new ConcurrentOutputStreamGateway(this, producerId);
-        return new CommittedStringPipe(new CommittedBytePipe(OutputStreamGateway, minElementsWrittenUntilFlush),
-                        charset);
+        BufferInGateway OutputStreamGateway = new BufferInGateway(this, producerId);
+        return new TXStringPipe(new TXBytePipe(OutputStreamGateway, minPipeTXSize), charset);
     }
 
     private int registerPipe() {
@@ -158,19 +155,19 @@ public final class ConcurrentOutputStreamBuffer {
     }
 
     private void initBuffers(Integer producerId) {
-        ArrayList<Buffer> buffers = Stream.generate(() -> new Buffer(minElementsWrittenUntilFlush, memThrottleFactor))
-                        .limit(2).collect(toCollection(ArrayList::new));
+        ArrayList<Buffer> buffers = Stream.generate(() -> new Buffer(minPipeTXSize, memThrottleFactor)).limit(2)
+                        .collect(toCollection(ArrayList::new));
 
         producerAssociatedBuffers.put(producerId, buffers);
         allProducersBuffers.addAll(buffers);
     }
 
-    public CommittedGenericPipe acquireWritableGenericPipe() {
+    public TXGenericPipe acquireWritableGenericPipe() {
         final int producerId = registerPipe();
         initBuffers(producerId);
 
-        ConcurrentOutputStreamGateway OutputStreamGateway = new ConcurrentOutputStreamGateway(this, producerId);
-        return new CommittedGenericPipe(new CommittedBytePipe(OutputStreamGateway, minElementsWrittenUntilFlush));
+        BufferInGateway OutputStreamGateway = new BufferInGateway(this, producerId);
+        return new TXGenericPipe(new TXBytePipe(OutputStreamGateway, minPipeTXSize));
     }
 
     void write(byte[] b, int off, int len, Integer producerId) throws IOException {
@@ -187,8 +184,8 @@ public final class ConcurrentOutputStreamBuffer {
                     hasDirtyWrite.set(true);
                     if (buffer.rwTryLock()) {
                         try {
-                            WeakFixedByteArray buf = buffer.byteArray;
-                            if (buf.write(b, off, len)) {
+                            if (buffer.write(b, off, len)) {
+                                buffer.commitBytes(len - off);
                                 return;
                             }
                         } finally {
@@ -244,10 +241,8 @@ public final class ConcurrentOutputStreamBuffer {
         for (Buffer buffer : buffers) {
             if (buffer.rwTryLock()) {
                 try {
-                    WeakFixedByteArray buf = buffer.byteArray;
-                    if (buf.size() > 0) {
-                        buf.writeTo(outputStream, writeEqualChunks);
-                        buf.reset();
+                    if (buffer.size() > 0) {
+                        bufferOutGateway.eatBytes(buffer);
                     } else {
                         emptyBuffersCount++;
                     }
@@ -284,7 +279,7 @@ public final class ConcurrentOutputStreamBuffer {
 
     private void close() throws IOException {
         executor.shutdown();
-        outputStream.close();
+        bufferOutGateway.close();
     }
 
     public static Builder builder(OutputStream outputStream) {
@@ -293,20 +288,22 @@ public final class ConcurrentOutputStreamBuffer {
 
     public static final class Builder {
         private final OutputStream outputStream;
-        private int minElementsWrittenUntilFlush = 8192;
+        private int minPipeTXSize = 8192;
         private int memThrottleFactor = 64;
-        private boolean writeEqualChunks = false;
-        private long millisUntilThrottleProducer = 1000;
+        private long millisUntilThrottleProducer = 100;
+        private int desiredOutputChunkSize = 0;
 
         private Builder(OutputStream outputStream) {
             Preconditions.checkNotNull(outputStream, "Required: outputStream not null");
             this.outputStream = outputStream;
         }
 
-        public Builder withMinElementsWrittenUntilFlush(int minElementsWrittenUntilFlush) {
-            Preconditions.checkArgument(minElementsWrittenUntilFlush >= 128,
-                            "Required: minElementsWrittenUntilFlush >= 128");
-            this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
+        public Builder inWrite(int minPipeTXSize) {
+            Preconditions.checkArgument(minPipeTXSize >= 128, "Required: minPipeTXSize >= 128");
+            Preconditions.checkArgument(desiredOutputChunkSize == 0 || desiredOutputChunkSize >= minPipeTXSize,
+                            "Required: outWrite >= inWrite");
+
+            this.minPipeTXSize = minPipeTXSize;
             return this;
         }
 
@@ -322,29 +319,68 @@ public final class ConcurrentOutputStreamBuffer {
             return this;
         }
 
-        public Builder withEqualChunks(boolean writeEqualChunks) {
-            this.writeEqualChunks = writeEqualChunks;
+        public Builder outWrite(int desiredOutputChunkSize) {
+            Preconditions.checkArgument(desiredOutputChunkSize >= 128, "Required: desiredOutputChunkSize >= 128");
+            Preconditions.checkArgument(desiredOutputChunkSize >= minPipeTXSize, "Required: outWrite >= inWrite");
+
+            this.desiredOutputChunkSize = desiredOutputChunkSize;
             return this;
         }
 
         public ConcurrentOutputStreamBuffer build() {
-            return new ConcurrentOutputStreamBuffer(outputStream, minElementsWrittenUntilFlush, memThrottleFactor,
-                            millisUntilThrottleProducer, writeEqualChunks);
+            if (desiredOutputChunkSize != 0) {
+                return new ConcurrentOutputStreamBuffer(
+                                new ResizableOutputStreamGateway(outputStream, desiredOutputChunkSize), minPipeTXSize,
+                                memThrottleFactor, millisUntilThrottleProducer);
+            } else {
+                return new ConcurrentOutputStreamBuffer(new SimplePassThroughGateway(outputStream), minPipeTXSize,
+                                memThrottleFactor, millisUntilThrottleProducer);
+            }
         }
     }
 
     @VisibleForTesting
     static final class Buffer {
         private final ReentrantLock lock;
-        final WeakFixedByteArray byteArray;
-        final Object condition;
+        private final Object condition;
+        private final WeakFixedByteArray byteArray;
+        final Repository repository;
 
         Buffer(int chunkSize, int memThrottleFactor) {
             this.lock = new ReentrantLock();
             this.condition = new Object();
+            this.repository = new Repository(memThrottleFactor);
 
             int initialSize = chunkSize * INITIAL_BUFFER_SIZE_MULTIPLIER;
             this.byteArray = new WeakFixedByteArray(chunkSize, initialSize, memThrottleFactor);
+        }
+
+        boolean write(byte[] b, int off, int len) {
+            return byteArray.write(b, off, len);
+        }
+
+        void writeTo(OutputStream outputStream, int off, int len) throws IOException {
+            byteArray.writeTo(outputStream, off, len);
+        }
+
+        void writeTo(ByteArray b, int off, int len) throws IOException {
+            byteArray.writeTo(b, off, len);
+        }
+
+        void commitBytes(int len) {
+            repository.commit(len);
+        }
+
+        void clear() {
+            byteArray.clear();
+        }
+
+        int size() {
+            return byteArray.size();
+        }
+
+        void size(int size) {
+            byteArray.size(size);
         }
 
         void rwLock() {
@@ -376,6 +412,58 @@ public final class ConcurrentOutputStreamBuffer {
         }
     }
 
+    static class Repository {
+        private final IntArrayList commits;
+        private int totalCommittedBytes;
+
+        Repository(int initialSize) {
+            this.commits = new IntArrayList(initialSize);
+            this.totalCommittedBytes = 0;
+        }
+
+        void commit(int len) {
+            totalCommittedBytes += len;
+            commits.add(len);
+        }
+
+        void reset() {
+            commits.clear();
+            totalCommittedBytes = 0;
+        }
+
+        int consume(int len) {
+            if (totalCommittedBytes <= 0) {
+                return 0;
+            }
+
+            int size = commits.size();
+            if (size == 1 || len >= totalCommittedBytes) {
+                return consumeAll();
+            }
+
+            int consumedBytes = 0;
+            for (int i = 0; i < len; i++) {
+                int reverseIdx = size - i - 1;
+                consumedBytes += commits.getInt(reverseIdx);
+
+                if (consumedBytes >= len) {
+                    commits.size(size - (i + 1));
+                    totalCommittedBytes -= consumedBytes;
+                    break;
+                }
+            }
+
+            return consumedBytes;
+        }
+
+        int consumeAll() {
+            int total = totalCommittedBytes;
+            reset();
+
+            return total;
+        }
+    }
+
     @VisibleForTesting
     static final class WeakFixedByteArray {
         private final int maxSize;
@@ -396,31 +484,27 @@ public final class ConcurrentOutputStreamBuffer {
             return arr;
         }
 
-        void writeTo(OutputStream outputStream, boolean equalChunks) throws IOException {
-            if (equalChunks && count > chunkSize) {
-                int skipLastChunkDuringIteration = count - chunkSize;
-                int readOffset = 0;
+        void writeTo(OutputStream outputStream) throws IOException {
+            writeTo(outputStream, 0, arr.length);
+        }
 
-                while (readOffset < skipLastChunkDuringIteration) {
-                    outputStream.write(arr, readOffset, chunkSize);
-                    readOffset += chunkSize;
-                }
+        void writeTo(OutputStream outputStream, int off, int len) throws IOException {
+            outputStream.write(arr, off, len);
+        }
 
-                int leftOvers = count - readOffset;
-                if (leftOvers != 0) {
-                    outputStream.write(arr, readOffset, leftOvers);
-                }
-
-            } else {
-                outputStream.write(arr, 0, count);
-            }
+        void writeTo(ByteArray b, int off, int len) throws IOException {
+            b.write(arr, off, len);
         }
 
         int size() {
             return count;
         }
 
-        void reset() {
+        void size(int newSize) {
+            count = Math.min(count, newSize);
+        }
+
+        void clear() {
             count = 0;
         }
 

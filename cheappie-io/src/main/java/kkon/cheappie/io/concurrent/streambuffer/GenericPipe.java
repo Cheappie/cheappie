@@ -21,13 +21,11 @@ import java.nio.charset.StandardCharsets;
 class GenericPipe implements Closeable {
     private final BytePipe pipe;
     private final DataOutputStream dataOutputStream;
-    private final BytePipeToOutputStreamGateway bytePipeGateway;
     private final ByteArray utf8TemporaryBuffer;
 
     GenericPipe(BytePipe pipe, int minElementsWrittenUntilFlush) {
         this.pipe = pipe;
-        this.bytePipeGateway = new BytePipeToOutputStreamGateway(pipe);
-        this.dataOutputStream = new DataOutputStream(bytePipeGateway);
+        this.dataOutputStream = new DataOutputStream(pipe);
         this.utf8TemporaryBuffer = new ByteArray(minElementsWrittenUntilFlush);
     }
 
@@ -86,11 +84,11 @@ class GenericPipe implements Closeable {
                 utf8TemporaryBuffer.write(0x80 | (c & 0x3f));
             } else {
                 utf8TemporaryBuffer.reset();
-                bytePipeGateway.write(str.getBytes(StandardCharsets.UTF_8));
+                pipe.write(str.getBytes(StandardCharsets.UTF_8));
                 return;
             }
         }
-        utf8TemporaryBuffer.resetAfterWriteTo(bytePipeGateway);
+        utf8TemporaryBuffer.resetAfterWriteTo(pipe);
     }
 
     public void writeCharsUTF8(char[] chars) throws IOException {
@@ -112,11 +110,11 @@ class GenericPipe implements Closeable {
                 utf8TemporaryBuffer.write(0x80 | (c & 0x3F));
             } else {
                 utf8TemporaryBuffer.reset();
-                bytePipeGateway.write(new String(chars).getBytes(StandardCharsets.UTF_8));
+                pipe.write(new String(chars).getBytes(StandardCharsets.UTF_8));
                 return;
             }
         }
-        utf8TemporaryBuffer.resetAfterWriteTo(bytePipeGateway);
+        utf8TemporaryBuffer.resetAfterWriteTo(pipe);
     }
 
     @Override

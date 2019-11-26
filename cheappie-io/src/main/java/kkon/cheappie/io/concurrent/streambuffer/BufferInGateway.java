@@ -16,12 +16,11 @@ package kkon.cheappie.io.concurrent.streambuffer;
 import java.io.IOException;
 import java.io.OutputStream;
 
-final class ConcurrentOutputStreamGateway extends OutputStream {
+final class BufferInGateway extends OutputStream {
     private final ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer;
     private final Integer producerId;
 
-    ConcurrentOutputStreamGateway(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer,
-                                  Integer producerId) {
+    BufferInGateway(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId) {
         this.concurrentOutputStreamBuffer = concurrentOutputStreamBuffer;
         this.producerId = producerId;
     }

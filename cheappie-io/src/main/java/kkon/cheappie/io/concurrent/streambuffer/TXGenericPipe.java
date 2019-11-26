@@ -13,29 +13,19 @@
 
 package kkon.cheappie.io.concurrent.streambuffer;
 
-import java.io.IOException;
-import java.io.OutputStream;
+public final class TXGenericPipe extends GenericPipe {
+    private final TXBytePipe pipe;
 
-
-final class BytePipeToOutputStreamGateway extends OutputStream {
-    private final BytePipe pipe;
-
-    BytePipeToOutputStreamGateway(BytePipe pipe) {
+    TXGenericPipe(TXBytePipe pipe) {
+        super(pipe, pipe.minPipeTXSize);
         this.pipe = pipe;
     }
 
-    @Override
-    public void write(int b) throws IOException {
-        pipe.write(b);
+    Integer getProducerId() {
+        return pipe.getProducerId();
     }
 
-    @Override
-    public void write(byte[] b) throws IOException {
-        pipe.write(b);
-    }
-
-    @Override
-    public void write(byte[] b, int off, int len) throws IOException {
-        pipe.write(b, off, len);
+    public void commit() {
+        pipe.commit();
     }
 }

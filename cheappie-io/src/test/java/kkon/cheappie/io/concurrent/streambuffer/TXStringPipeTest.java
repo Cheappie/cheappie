@@ -32,19 +32,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Nested
-class CommittedStringPipeTest {
+class TXStringPipeTest {
     private Random random = new Random();
 
     @Test
     void shouldWriteCommited() throws IOException, ExecutionException, InterruptedException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         ConcurrentOutputStreamBuffer buffer = ConcurrentOutputStreamBuffer.builder(outputStream)
-                        .withMinElementsWrittenUntilFlush(128).build();
+                        .inWrite(128).build();
         final ConcurrentOutputStreamBuffer.CompletionNotifier notifier = buffer.declareExactProducersCount(1);
 
         int commitedCharsCount = 126;
         int writtenCharsCount = commitedCharsCount;
-        try (CommittedStringPipe pipe = buffer.acquireWritableStringPipe()) {
+        try (TXStringPipe pipe = buffer.acquireWritableStringPipe()) {
             pipe.write(nChars(commitedCharsCount));
             pipe.commit();
 
@@ -72,7 +72,7 @@ class CommittedStringPipeTest {
         ConcurrentOutputStreamBuffer streamBuffer = ConcurrentOutputStreamBuffer.builder(outputStream).build();
 
         ConcurrentOutputStreamBuffer.CompletionNotifier notifier = streamBuffer.declareExactProducersCount(1);
-        try (CommittedStringPipe pipe = streamBuffer.acquireWritableStringPipe()) {
+        try (TXStringPipe pipe = streamBuffer.acquireWritableStringPipe()) {
             contentProvider.accept(pipe);
             pipe.commit();
         }

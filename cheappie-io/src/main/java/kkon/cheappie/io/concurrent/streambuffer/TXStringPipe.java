@@ -16,23 +16,23 @@ package kkon.cheappie.io.concurrent.streambuffer;
 import java.io.IOException;
 import java.nio.charset.Charset;
 
-public final class CommittedStringPipe extends StringPipe {
-    private final CommittedBytePipe pipe;
-    private final int minElementsWrittenUntilFlush;
+public final class TXStringPipe extends StringPipe {
+    private final TXBytePipe pipe;
+    private final int minPipeTXSize;
     private int lastCommitIndex;
 
-    CommittedStringPipe(CommittedBytePipe pipe, Charset charset) {
-        super(pipe, pipe.minElementsWrittenUntilFlush, charset);
+    TXStringPipe(TXBytePipe pipe, Charset charset) {
+        super(pipe, pipe.minPipeTXSize, charset);
         this.pipe = pipe;
         this.lastCommitIndex = 0;
-        this.minElementsWrittenUntilFlush = pipe.minElementsWrittenUntilFlush;
+        this.minPipeTXSize = pipe.minPipeTXSize;
     }
 
     @Override
     protected void flush(int incomingCharsCount, boolean forceWrite) throws IOException {
         int actuallyWrittenSize = size();
 
-        if ((forceWrite || actuallyWrittenSize + incomingCharsCount >= minElementsWrittenUntilFlush)
+        if ((forceWrite || actuallyWrittenSize + incomingCharsCount >= minPipeTXSize)
                         && lastCommitIndex > 0) {
             unconditionalFlush(lastCommitIndex);
             pipe.commit();

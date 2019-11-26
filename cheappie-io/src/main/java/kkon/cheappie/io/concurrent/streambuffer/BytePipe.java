@@ -13,29 +13,29 @@
 
 package kkon.cheappie.io.concurrent.streambuffer;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.Optional;
 
 
-class BytePipe implements Closeable {
+class BytePipe extends OutputStream {
     private final OutputStream outputStream;
-    protected final int minElementsWrittenUntilFlush;
+    protected final int minPipeTXSize;
     protected final ByteArray locBuffer;
 
     private boolean isPipeClosed = false;
 
-    BytePipe(OutputStream outputStream, int minElementsWrittenUntilFlush) {
+    BytePipe(OutputStream outputStream, int minPipeTXSize) {
         this.outputStream = outputStream;
-        this.minElementsWrittenUntilFlush = minElementsWrittenUntilFlush;
-        this.locBuffer = new ByteArray(minElementsWrittenUntilFlush);
+        this.minPipeTXSize = minPipeTXSize;
+        this.locBuffer = new ByteArray(minPipeTXSize);
     }
 
     boolean isClosed() {
         return isPipeClosed;
     }
 
-    void write(int b) throws IOException {
+    public void write(int b) throws IOException {
         ensureOpen();
 
         flush(1, false);
@@ -45,7 +45,7 @@ class BytePipe implements Closeable {
     protected void flush(int incomingBytesCount, boolean forceWrite) throws IOException {
         int actuallyWrittenSize = locBuffer.size();
 
-        if (forceWrite || actuallyWrittenSize + incomingBytesCount >= minElementsWrittenUntilFlush) {
+        if (forceWrite || actuallyWrittenSize + incomingBytesCount >= minPipeTXSize) {
             unconditionalFlush(actuallyWrittenSize);
             locBuffer.reset();
         }
@@ -61,14 +61,14 @@ class BytePipe implements Closeable {
         }
     }
 
-    void write(byte[] b) throws IOException {
+    public void write(byte[] b) throws IOException {
         ensureOpen();
 
         flush(b.length, false);
         locBuffer.write(b);
     }
 
-    void write(byte[] b, int readOffset, int len) throws IOException {
+    public void write(byte[] b, int readOffset, int len) throws IOException {
         ensureOpen();
 
         flush(len, false);
@@ -80,12 +80,12 @@ class BytePipe implements Closeable {
         if (isPipeClosed) {
             return;
         }
+        isPipeClosed = true;
 
-        try {
-            isPipeClosed = true;
-            flush(locBuffer.size(), true);
-        } finally {
-            outputStream.close();
+        Optional<Exception> exception =
+                        ExceptionUtil.invokeUnconditionally(() -> flush(locBuffer.size(), true), outputStream::close);
+        if (exception.isPresent()) {
+            throw new IOException(exception.get());
         }
     }
 }
