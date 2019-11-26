@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Cheappie Authors
+ * Copyright (C) 2019 Kamil Konior
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
  * the License. You may obtain a copy of the License at
@@ -15,13 +15,9 @@ package kkon.cheappie.io.concurrent.streambuffer;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import java.io.Closeable;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -47,19 +43,19 @@ public final class ConcurrentOutputStreamBuffer {
     private static final int INITIAL_BUFFER_SIZE_MULTIPLIER = 8;
 
     private final OutputStream outputStream;
-    private final int minElementsWrittenUntilFlush;
     private final int memThrottleFactor;
     private final long millisUntilThrottleProducer;
     private final boolean writeEqualChunks;
+    private final int minElementsWrittenUntilFlush;
 
     private final ScheduledExecutorService executor;
     private final ConcurrentHashMap<Integer, List<Buffer>> producerAssociatedBuffers;
     private final CopyOnWriteArrayList<Buffer> allProducersBuffers;
-    private final CopyOnWriteArrayList<Integer> detachedPipes;
+    final CopyOnWriteArrayList<Integer> detachedPipes;
 
     private final AtomicBoolean isStreamClosed;
-    private final AtomicInteger activePipesCount;
     private final AtomicBoolean hasDirtyWrite;
+    final AtomicInteger activePipesCount;
 
     private final AtomicInteger availableSlotsForProducers;
     private final AtomicBoolean areProducersAlreadyDeclared;
@@ -131,15 +127,17 @@ public final class ConcurrentOutputStreamBuffer {
         return new CompletionNotifier(future);
     }
 
-    public StringPipe acquireWritableStringPipe() {
+    public CommittedStringPipe acquireWritableStringPipe() {
         return acquireWritableStringPipe(Charset.defaultCharset());
     }
 
-    public StringPipe acquireWritableStringPipe(Charset charset) {
+    public CommittedStringPipe acquireWritableStringPipe(Charset charset) {
         int producerId = registerPipe();
         initBuffers(producerId);
 
-        return new StringPipe(this, producerId, charset);
+        ConcurrentOutputStreamGateway OutputStreamGateway = new ConcurrentOutputStreamGateway(this, producerId);
+        return new CommittedStringPipe(new CommittedBytePipe(OutputStreamGateway, minElementsWrittenUntilFlush),
+                        charset);
     }
 
     private int registerPipe() {
@@ -167,14 +165,15 @@ public final class ConcurrentOutputStreamBuffer {
         allProducersBuffers.addAll(buffers);
     }
 
-    public GenericPipe acquireWritableGenericPipe() {
+    public CommittedGenericPipe acquireWritableGenericPipe() {
         final int producerId = registerPipe();
         initBuffers(producerId);
 
-        return new GenericPipe(this, producerId);
+        ConcurrentOutputStreamGateway OutputStreamGateway = new ConcurrentOutputStreamGateway(this, producerId);
+        return new CommittedGenericPipe(new CommittedBytePipe(OutputStreamGateway, minElementsWrittenUntilFlush));
     }
 
-    private void write(byte[] b, int off, int len, Integer producerId) throws IOException {
+    void write(byte[] b, int off, int len, Integer producerId) throws IOException {
         if (len > 0) {
             List<Buffer> associatedBuffers = producerAssociatedBuffers.get(producerId);
             long lastEpochMillis = System.currentTimeMillis();
@@ -378,450 +377,6 @@ public final class ConcurrentOutputStreamBuffer {
     }
 
     @VisibleForTesting
-    static final class BytePipe implements Closeable {
-        private final Integer producerId;
-        private final ByteArray locBuffer;
-        private final ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer;
-
-        private int lastCommitIndex = 0;
-        private boolean isPipeClosed = false;
-
-        private BytePipe(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId) {
-            this.producerId = producerId;
-            this.locBuffer = new ByteArray(concurrentOutputStreamBuffer.minElementsWrittenUntilFlush);
-            this.concurrentOutputStreamBuffer = concurrentOutputStreamBuffer;
-        }
-
-        Integer getProducerId() {
-            return producerId;
-        }
-
-        boolean isPipeClosed() {
-            return isPipeClosed;
-        }
-
-        void commit() {
-            lastCommitIndex = locBuffer.size();
-        }
-
-        void write(int b) throws IOException {
-            ensureOpen();
-
-            flush(1, false);
-            locBuffer.write(b);
-        }
-
-        private void flush(int incomingBytesCount, boolean forceWriteCommited) throws IOException {
-            try {
-                if ((forceWriteCommited || locBuffer.size()
-                                + incomingBytesCount >= concurrentOutputStreamBuffer.minElementsWrittenUntilFlush)
-                                && lastCommitIndex > 0) {
-                    concurrentOutputStreamBuffer.write(locBuffer.elements(), 0, lastCommitIndex, producerId);
-                    locBuffer.softTrim(lastCommitIndex);
-                    lastCommitIndex = 0;
-                }
-            } catch (Exception e) {
-                closePipeAndCleanup();
-                throw e;
-            }
-        }
-
-        private void ensureOpen() throws IOException {
-            if (isPipeClosed) {
-                throw new IOException("Pipe has been closed.");
-            }
-        }
-
-        void write(byte[] b) throws IOException {
-            ensureOpen();
-
-            flush(b.length, false);
-            locBuffer.write(b);
-        }
-
-        void write(byte[] b, int readOffset, int len) throws IOException {
-            ensureOpen();
-
-            flush(len, false);
-            locBuffer.write(b, readOffset, len);
-        }
-
-        @Override
-        public void close() throws IOException {
-            if (isPipeClosed) {
-                return;
-            }
-
-            flush(locBuffer.size(), true);
-            closePipeAndCleanup();
-        }
-
-        private void closePipeAndCleanup() {
-            isPipeClosed = true;
-            concurrentOutputStreamBuffer.activePipesCount.decrementAndGet();
-            concurrentOutputStreamBuffer.detachedPipes.add(producerId);
-        }
-    }
-
-    @VisibleForTesting
-    static final class BytePipeToOutputStreamGateway extends OutputStream {
-        private final BytePipe pipe;
-
-        private BytePipeToOutputStreamGateway(BytePipe pipe) {
-            this.pipe = pipe;
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            pipe.write(b);
-        }
-
-        @Override
-        public void write(byte[] b) throws IOException {
-            pipe.write(b);
-        }
-
-        @Override
-        public void write(byte[] b, int off, int len) throws IOException {
-            pipe.write(b, off, len);
-        }
-    }
-
-    public static final class GenericPipe implements Closeable {
-        private final BytePipe pipe;
-        private final DataOutputStream dataOutputStream;
-        private final BytePipeToOutputStreamGateway bytePipeGateway;
-        private final ByteArray utf8TemporaryBuffer;
-
-        private GenericPipe(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId) {
-            this.pipe = new BytePipe(concurrentOutputStreamBuffer, producerId);
-
-            this.bytePipeGateway = new BytePipeToOutputStreamGateway(pipe);
-            this.dataOutputStream = new DataOutputStream(bytePipeGateway);
-            this.utf8TemporaryBuffer = new ByteArray(concurrentOutputStreamBuffer.minElementsWrittenUntilFlush);
-        }
-
-        @VisibleForTesting
-        Integer getProducerId() {
-            return pipe.getProducerId();
-        }
-
-        public void write(int b) throws IOException {
-            pipe.write(b);
-        }
-
-        public void write(byte[] b) throws IOException {
-            pipe.write(b);
-        }
-
-        public void write(byte[] b, int readOffset, int len) throws IOException {
-            pipe.write(b, readOffset, len);
-        }
-
-        public void commit() {
-            pipe.commit();
-        }
-
-        public void writeBytesOfBoolean(boolean v) throws IOException {
-            dataOutputStream.writeBoolean(v);
-        }
-
-        public void writeBytesOfShort(int v) throws IOException {
-            dataOutputStream.writeShort(v);
-        }
-
-        public void writeBytesOfInt(int v) throws IOException {
-            dataOutputStream.writeInt(v);
-        }
-
-        public void writeBytesOfLong(long v) throws IOException {
-            dataOutputStream.writeLong(v);
-        }
-
-        public void writeBytesOfFloat(float v) throws IOException {
-            dataOutputStream.writeFloat(v);
-        }
-
-        public void writeBytesOfDouble(double v) throws IOException {
-            dataOutputStream.writeDouble(v);
-        }
-
-        public void writeStringUTF8(String str) throws IOException {
-            writeStringUTF8(str, 0, str.length());
-        }
-
-        public void writeStringUTF8(String str, int off, int len) throws IOException {
-            for (int i = 0; i < len; i++) {
-                char c = str.charAt(off + i);
-
-                if (c < 0x80) {
-                    utf8TemporaryBuffer.write(c);
-                } else if (c < 0x800) {
-                    utf8TemporaryBuffer.write(0xc0 | (c >> 6));
-                    utf8TemporaryBuffer.write(0x80 | (c & 0x3f));
-                } else if (!Character.isSurrogate(c)) {
-                    utf8TemporaryBuffer.write(0xe0 | (c >> 12));
-                    utf8TemporaryBuffer.write(0x80 | ((c >> 6) & 0x3f));
-                    utf8TemporaryBuffer.write(0x80 | (c & 0x3f));
-                } else {
-                    utf8TemporaryBuffer.reset();
-                    bytePipeGateway.write(str.getBytes(StandardCharsets.UTF_8));
-                    return;
-                }
-            }
-            utf8TemporaryBuffer.resetAfterWriteTo(bytePipeGateway);
-        }
-
-        public void writeCharsUTF8(char[] chars) throws IOException {
-            writeCharsUTF8(chars, 0, chars.length);
-        }
-
-        public void writeCharsUTF8(char[] chars, int off, int len) throws IOException {
-            for (int i = 0; i < len; i++) {
-                char c = chars[off + i];
-
-                if (c < 0x80) {
-                    utf8TemporaryBuffer.write(c);
-                } else if (c < 0x800) {
-                    utf8TemporaryBuffer.write(0xc0 | (c >> 6));
-                    utf8TemporaryBuffer.write(0x80 | (c & 0x3F));
-                } else if (!Character.isSurrogate(c)) {
-                    utf8TemporaryBuffer.write(0xe0 | (c >> 12));
-                    utf8TemporaryBuffer.write(0x80 | ((c >> 6) & 0x3F));
-                    utf8TemporaryBuffer.write(0x80 | (c & 0x3F));
-                } else {
-                    utf8TemporaryBuffer.reset();
-                    bytePipeGateway.write(new String(chars).getBytes(StandardCharsets.UTF_8));
-                    return;
-                }
-            }
-            utf8TemporaryBuffer.resetAfterWriteTo(bytePipeGateway);
-        }
-
-        @Override
-        public void close() throws IOException {
-            if (pipe.isPipeClosed()) {
-                return;
-            }
-
-            pipe.close();
-        }
-    }
-
-    static final class StringPipe implements Closeable {
-        private final String lineSeparator;
-        private final OutputStreamWriter stringPipeOutputStream;
-        private final StringBuilder buffer;
-        private final BytePipe pipe;
-
-        private final char[] transportBuffer;
-        private final int chunkSize;
-        private int lastCommitIndex;
-
-        private StringPipe(ConcurrentOutputStreamBuffer concurrentOutputStreamBuffer, Integer producerId,
-                        Charset charset) {
-            int size = concurrentOutputStreamBuffer.minElementsWrittenUntilFlush;
-
-            this.lineSeparator = System.lineSeparator();
-            this.pipe = new BytePipe(concurrentOutputStreamBuffer, producerId);
-            this.stringPipeOutputStream = new OutputStreamWriter(new BytePipeToOutputStreamGateway(pipe), charset);
-
-            this.buffer = new StringBuilder(size);
-            this.transportBuffer = new char[size];
-            this.chunkSize = size;
-            this.lastCommitIndex = 0;
-        }
-
-        public int size() {
-            return buffer.length();
-        }
-
-        private void writeTo(OutputStreamWriter outputStreamWriter, int readOffset, int len) throws IOException {
-            int skipLastChunkDuringIteration = len - chunkSize;
-
-            while (readOffset < skipLastChunkDuringIteration) {
-                int nextEndIndex = readOffset + chunkSize;
-
-                buffer.getChars(readOffset, nextEndIndex, transportBuffer, 0);
-                outputStreamWriter.write(transportBuffer);
-
-                readOffset += chunkSize;
-            }
-
-            int leftOvers = len - readOffset;
-            if (leftOvers > 0) {
-                buffer.getChars(readOffset, readOffset + leftOvers, transportBuffer, 0);
-                outputStreamWriter.write(transportBuffer, 0, leftOvers);
-            }
-        }
-
-        public void commit() {
-            this.lastCommitIndex = buffer.length();
-        }
-
-        private void flushCommitedWhenBufferExceedsSingleChunkSize() throws IOException {
-            if (buffer.length() >= chunkSize && lastCommitIndex > 0) {
-                flushCommited();
-                buffer.delete(0, lastCommitIndex);
-                lastCommitIndex = 0;
-            }
-        }
-
-        private void flushCommited() throws IOException {
-            writeTo(stringPipeOutputStream, 0, lastCommitIndex);
-            stringPipeOutputStream.flush();
-            pipe.commit();
-        }
-
-        public void write(String str) throws IOException {
-            buffer.append(str);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(StringBuffer sb) throws IOException {
-            buffer.append(sb);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(CharSequence s) throws IOException {
-            buffer.append(s);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(CharSequence s, int start, int end) throws IOException {
-            buffer.append(s, start, end);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(char[] str) throws IOException {
-            buffer.append(str);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(char[] str, int offset, int len) throws IOException {
-            buffer.append(str, offset, len);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(boolean b) throws IOException {
-            buffer.append(b);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(char c) throws IOException {
-            buffer.append(c);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(int i) throws IOException {
-            buffer.append(i);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(long lng) throws IOException {
-            buffer.append(lng);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(float f) throws IOException {
-            buffer.append(f);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void write(double d) throws IOException {
-            buffer.append(d);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        public void newLine() throws IOException {
-            buffer.append(lineSeparator);
-            flushCommitedWhenBufferExceedsSingleChunkSize();
-        }
-
-        @Override
-        public void close() throws IOException {
-            if (pipe.isPipeClosed()) {
-                return;
-            }
-
-            flushCommited();
-            pipe.close();
-        }
-    }
-
-    @VisibleForTesting
-    static final class ByteArray {
-        private byte[] arr;
-        private int count;
-
-        ByteArray(int size) {
-            this.arr = new byte[size];
-            this.count = 0;
-        }
-
-        byte[] elements() {
-            return arr;
-        }
-
-        void writeTo(OutputStream outputStream) throws IOException {
-            outputStream.write(arr, 0, count);
-        }
-
-        void resetAfterWriteTo(OutputStream outputStream) throws IOException {
-            outputStream.write(arr, 0, count);
-            reset();
-        }
-
-        void softTrim(int len) {
-            if (count > len) {
-                int leftOversCount = count - len;
-
-                System.arraycopy(arr, len, arr, 0, leftOversCount);
-                count = leftOversCount;
-            } else {
-                reset();
-            }
-        }
-
-        int size() {
-            return count;
-        }
-
-        void reset() {
-            count = 0;
-        }
-
-        void write(int b) {
-            ensureCapacity(1);
-
-            arr[count++] = (byte) b;
-        }
-
-        void write(byte[] b) {
-            write(b, 0, b.length);
-        }
-
-        void write(byte[] b, int off, int len) {
-            ensureCapacity(len);
-
-            System.arraycopy(b, off, arr, count, len);
-            count += len;
-        }
-
-        private void ensureCapacity(int incomingBytesCount) {
-            if (count + incomingBytesCount > arr.length) {
-                int newBufferLength = arr.length;
-
-                while (newBufferLength < count + incomingBytesCount) {
-                    newBufferLength *= 2;
-                }
-
-                this.arr = Arrays.copyOf(arr, newBufferLength);
-            }
-        }
-    }
-
-    @VisibleForTesting
     static final class WeakFixedByteArray {
         private final int maxSize;
         private final int chunkSize;
@@ -932,7 +487,7 @@ public final class ConcurrentOutputStreamBuffer {
             return task.isDone();
         }
 
-        public void waitUntilDone() throws ExecutionException, InterruptedException {
+        public void awaitCompletion() throws ExecutionException, InterruptedException {
             task.get();
         }
     }
