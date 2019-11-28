@@ -26,7 +26,7 @@ final class ResizableOutputStreamGateway extends BufferOutGateway {
     ResizableOutputStreamGateway(OutputStream outputStream, int desiredOutputChunkSize) {
         super(outputStream);
         this.desiredOutputChunkSize = desiredOutputChunkSize;
-        this.locBuffer = new ByteArray(desiredOutputChunkSize * 2);
+        this.locBuffer = new ByteArray(desiredOutputChunkSize << 1);
     }
 
     public void eatBytes(ConcurrentOutputStreamBuffer.Buffer buffer) throws IOException {

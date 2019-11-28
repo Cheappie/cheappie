@@ -185,7 +185,7 @@ public final class ConcurrentOutputStreamBuffer {
                     if (buffer.rwTryLock()) {
                         try {
                             if (buffer.write(b, off, len)) {
-                                buffer.commitBytes(len - off);
+                                buffer.commitBytes(len);
                                 return;
                             }
                         } finally {
@@ -467,7 +467,6 @@ public final class ConcurrentOutputStreamBuffer {
     @VisibleForTesting
     static final class WeakFixedByteArray {
         private final int maxSize;
-        private final int chunkSize;
         private byte[] arr;
         private int count;
 
@@ -475,7 +474,6 @@ public final class ConcurrentOutputStreamBuffer {
             this.maxSize = chunkSize * memThrottleFactor;
             Preconditions.checkArgument(maxSize >= initialSize, "memThrottleFactor is too low.");
 
-            this.chunkSize = chunkSize;
             this.arr = new byte[initialSize];
             this.count = 0;
         }
@@ -544,7 +542,7 @@ public final class ConcurrentOutputStreamBuffer {
             int newBufferLength = arr.length;
 
             while (newBufferLength < count + incomingBytesCount) {
-                newBufferLength *= 2;
+                newBufferLength <<= 1;
             }
 
             return newBufferLength;

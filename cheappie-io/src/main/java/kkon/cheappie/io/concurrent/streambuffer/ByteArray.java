@@ -81,7 +81,7 @@ final class ByteArray {
             int newBufferLength = arr.length;
 
             while (newBufferLength < count + incomingBytesCount) {
-                newBufferLength *= 2;
+                newBufferLength <<= 1;
             }
 
             this.arr = Arrays.copyOf(arr, newBufferLength);
